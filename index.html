@@ -20,7 +20,9 @@
     .card{background:var(--card); border:1px solid var(--border); border-radius:16px; padding:12px; box-shadow:0 6px 28px rgba(0,0,0,.25)}
     .grid{display:grid; gap:16px}
     @media(min-width:880px){.grid{grid-template-columns:1.1fr .9fr}}
-    .drop{border:1.5px dashed var(--border); border-radius:14px; padding:12px; text-align:center; cursor:pointer; background:linear-gradient(180deg, rgba(255,255,255,.03), rgba(255,255,255,0)); position:relative}
+    .drop{border:1.5px dashed var(--border); border-radius:14px; padding:12px; text-align:center; cursor:pointer; background:linear-gradient(180deg, rgba(255,255,255,.03), rgba(255,255,255,0)); position:relative; transition:.18s ease border-color, .18s ease background}
+    .drop.dragover{border-color:rgba(77,163,255,.6); background:rgba(77,163,255,.08)}
+    .drop.disabled{opacity:.6; pointer-events:none}
     .fileInput{position:absolute; inset:0; opacity:0; cursor:pointer}
     .btn{appearance:none; background:var(--accent); color:#001122; border:0; border-radius:12px; padding:12px 16px; font-weight:700; cursor:pointer}
     .btn[disabled]{opacity:.5; cursor:not-allowed}
@@ -142,7 +144,7 @@
   </div>
 
   <script src="https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js"></script>
-  <script src="./libs/ffmpeg/ffmpeg.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@ffmpeg/ffmpeg@0.12.6/dist/ffmpeg.min.js"></script>
   <script>
     const $ = (s, p=document) => p.querySelector(s);
     const ui = {
@@ -166,12 +168,483 @@
       ffmpegStatus: $('#ffmpegStatus'),
     };
 
-    // делаем "Часы" пресет по умолчанию и фиксируем при загрузке
-    window.addEventListener('DOMContentLoaded', ()=>{
-      ui.preset.value = 'pack30';
-    });
+    const state = {
+      entries: [],
+      processing: false,
+      ffmpeg: null,
+      ffmpegReady: false,
+      ffmpegLoading: null,
+    };
 
-    // остальные функции (ensureFFmpeg, onFiles, processAll, etc.) остаются без изменений
+    const MIN_BITRATE = 24;
+    const MAX_BITRATE = 192;
+
+    const clampBitrate = (v) => {
+      if (!Number.isFinite(v)) return null;
+      const rounded = Math.round(v / 4) * 4;
+      return Math.max(MIN_BITRATE, Math.min(MAX_BITRATE, rounded));
+    };
+
+    const formatDuration = (seconds) => {
+      if (!Number.isFinite(seconds) || seconds <= 0) return '—';
+      const total = Math.round(seconds);
+      const hrs = Math.floor(total / 3600);
+      const mins = Math.floor((total % 3600) / 60);
+      const secs = total % 60;
+      if (hrs) return `${hrs}:${String(mins).padStart(2,'0')}:${String(secs).padStart(2,'0')}`;
+      return `${mins}:${String(secs).padStart(2,'0')}`;
+    };
+
+    const formatSize = (mb) => {
+      if (!Number.isFinite(mb) || mb <= 0) return '—';
+      if (mb >= 1024) return `${(mb/1024).toFixed(2)} ГБ`;
+      return `${mb.toFixed(2)} МБ`;
+    };
+
+    const setFfmpegStatus = (text, tone) => {
+      ui.ffmpegStatus.textContent = text;
+      ui.ffmpegStatus.classList.remove('fine','warn','err');
+      if (tone) ui.ffmpegStatus.classList.add(tone);
+    };
+
+    const updatePlaceholder = () => {
+      if (!state.entries.length) {
+        ui.tbody.innerHTML = '<tr><td colspan="5" class="muted">Добавь файлы…</td></tr>';
+      }
+    };
+
+    const createRow = (entry) => {
+      const tr = document.createElement('tr');
+      tr.dataset.id = entry.id;
+
+      const nameTd = document.createElement('td');
+      nameTd.textContent = entry.file.name;
+
+      const durTd = document.createElement('td');
+      durTd.textContent = '—';
+
+      const bitrateTd = document.createElement('td');
+      bitrateTd.textContent = '—';
+
+      const progressTd = document.createElement('td');
+      const progress = document.createElement('progress');
+      progress.max = 100;
+      progress.value = 0;
+      progressTd.appendChild(progress);
+      const percent = document.createElement('div');
+      percent.className = 'muted';
+      percent.style.marginTop = '4px';
+      percent.textContent = '0%';
+      progressTd.appendChild(percent);
+
+      const statusTd = document.createElement('td');
+      statusTd.textContent = 'Ожидает';
+
+      tr.append(nameTd, durTd, bitrateTd, progressTd, statusTd);
+      ui.tbody.appendChild(tr);
+
+      entry.row = tr;
+      entry.durationCell = durTd;
+      entry.bitrateCell = bitrateTd;
+      entry.progressBar = progress;
+      entry.progressLabel = percent;
+      entry.statusCell = statusTd;
+    };
+
+    const getFileId = (file) => `${file.name}__${file.size}__${file.lastModified}`;
+
+    const sanitizeFileName = (name) => {
+      const base = name.replace(/\.[^/.]+$/, '');
+      const safe = base.replace(/[<>:"/\\|?*\u0000-\u001F]/g, '_').trim() || 'track';
+      return `${safe}.mp3`;
+    };
+
+    const invalidateOutputs = () => {
+      let reset = false;
+      state.entries.forEach((entry) => {
+        if (entry.state === 'done' || entry.output) reset = true;
+        entry.state = 'pending';
+        entry.output = null;
+        entry.outputName = null;
+        entry.progressBar.value = 0;
+        entry.progressLabel.textContent = '0%';
+        entry.statusCell.textContent = 'Ожидает';
+      });
+      if (reset) {
+        ui.overall.value = 0;
+      }
+      updateButtons();
+    };
+
+    const updateSummary = () => {
+      ui.count.textContent = state.entries.length;
+      const totalSeconds = state.entries.reduce((acc, entry) => acc + (entry.duration || 0), 0);
+      ui.sumdur.textContent = totalSeconds ? formatDuration(totalSeconds) : '0:00';
+    };
+
+    const updateEstimate = () => {
+      const totalMb = state.entries.reduce((acc, entry) => {
+        if (!entry.duration || !entry.targetKbps) return acc;
+        const kbTotal = entry.targetKbps * entry.duration;
+        const mb = kbTotal / 8 / 1024;
+        return acc + mb;
+      }, 0);
+      ui.est.textContent = totalMb ? formatSize(totalMb) : '—';
+    };
+
+    const setEntryBitrate = (entry, kbps) => {
+      entry.targetKbps = kbps || null;
+      entry.bitrateCell.textContent = kbps ? `${kbps}` : '—';
+    };
+
+    const recalcBitrates = () => {
+      if (!state.entries.length) {
+        updateEstimate();
+        updateButtons();
+        return null;
+      }
+      const preset = ui.preset.value;
+      const readyEntries = state.entries.filter((entry) => Number.isFinite(entry.duration) && entry.duration > 0);
+      let suggested = null;
+
+      if (preset === 'pack30') {
+        const target = Number(ui.targetMb.value) || 30;
+        const totalDuration = readyEntries.reduce((acc, entry) => acc + entry.duration, 0);
+        if (totalDuration > 0) {
+          const kbps = clampBitrate((target * 1024 * 1024 * 8) / totalDuration / 1000);
+          if (kbps) {
+            suggested = kbps;
+            state.entries.forEach((entry) => setEntryBitrate(entry, kbps));
+          }
+        }
+      } else if (preset === 'per3') {
+        const target = Number(ui.targetMb.value) || 3;
+        state.entries.forEach((entry) => {
+          if (entry.duration) {
+            const kbps = clampBitrate((target * 1024 * 1024 * 8) / entry.duration / 1000);
+            setEntryBitrate(entry, kbps);
+          } else {
+            setEntryBitrate(entry, null);
+          }
+        });
+      } else {
+        const custom = clampBitrate(Number(ui.bitrate.value) || 96);
+        if (custom) {
+          suggested = custom;
+          state.entries.forEach((entry) => setEntryBitrate(entry, custom));
+        }
+      }
+
+      updateEstimate();
+      updateButtons();
+      return suggested;
+    };
+
+    const flashCalcResult = (value) => {
+      const original = ui.calcBtn.textContent;
+      ui.calcBtn.textContent = `≈ ${value} кбит/с`;
+      setTimeout(() => {
+        ui.calcBtn.textContent = original;
+      }, 1800);
+    };
+
+    const updateButtons = () => {
+      const hasFiles = state.entries.length > 0;
+      const allHaveBitrate = state.entries.every((entry) => !!entry.targetKbps);
+      const hasReady = state.entries.some((entry) => entry.state === 'done');
+
+      ui.calcBtn.disabled = !hasFiles || state.processing;
+      ui.startBtn.disabled = !hasFiles || state.processing || !allHaveBitrate;
+      ui.zipBtn.disabled = !hasReady || state.processing;
+    };
+
+    const toggleControls = (locked) => {
+      state.processing = locked;
+      ui.chooseBtn.disabled = locked;
+      ui.input.disabled = locked;
+      ui.calcBtn.disabled = locked || !state.entries.length;
+      ui.preset.disabled = locked;
+      ui.targetMb.disabled = locked || ui.preset.value === 'custom';
+      ui.bitrate.disabled = locked || ui.preset.value !== 'custom';
+      ui.samplerate.disabled = locked;
+      ui.mono.disabled = locked;
+      ui.normalize.disabled = locked;
+      ui.drop.classList.toggle('disabled', locked);
+      updateButtons();
+    };
+
+    const handlePresetUi = () => {
+      ui.targetMb.disabled = state.processing || ui.preset.value === 'custom';
+      ui.bitrate.disabled = state.processing || ui.preset.value !== 'custom';
+    };
+
+    const ensureFfmpeg = async () => {
+      if (state.ffmpegReady) return state.ffmpeg;
+      if (state.ffmpegLoading) return state.ffmpegLoading;
+      if (!window.FFmpeg || !FFmpeg.createFFmpeg) {
+        setFfmpegStatus('FFmpeg: библиотека не найдена', 'err');
+        throw new Error('FFmpeg library missing');
+      }
+      setFfmpegStatus('FFmpeg: загружается…', 'warn');
+      const ffmpeg = FFmpeg.createFFmpeg({
+        log: false,
+        corePath: 'https://cdn.jsdelivr.net/npm/@ffmpeg/core@0.12.6/dist/ffmpeg-core.js',
+      });
+      state.ffmpeg = ffmpeg;
+      const loading = ffmpeg.load().then(() => {
+        state.ffmpegReady = true;
+        setFfmpegStatus('FFmpeg: готов', 'fine');
+        return ffmpeg;
+      }).catch((err) => {
+        setFfmpegStatus('FFmpeg: ошибка загрузки', 'err');
+        throw err;
+      }).finally(() => {
+        state.ffmpegLoading = null;
+      });
+      state.ffmpegLoading = loading;
+      return loading;
+    };
+
+    const updateOverall = (ratio) => {
+      const percent = Math.round(Math.max(0, Math.min(1, ratio)) * 100);
+      ui.overall.value = percent;
+    };
+
+    const processEntry = async (entry, index, total) => {
+      const ffmpeg = state.ffmpeg;
+      const inputName = `input_${index}_${Date.now()}`;
+      const outputName = sanitizeFileName(entry.file.name);
+      entry.state = 'processing';
+      entry.statusCell.textContent = 'Обработка…';
+      entry.progressBar.value = 0;
+      entry.progressLabel.textContent = '0%';
+
+      const data = await FFmpeg.fetchFile(entry.file);
+      ffmpeg.FS('writeFile', inputName, data);
+
+      const args = ['-y', '-i', inputName, '-vn'];
+      if (ui.normalize.checked) {
+        args.push('-af', 'loudnorm=I=-18:LRA=11:TP=-1.5');
+      }
+      args.push('-ac', ui.mono.checked ? '1' : '2');
+      args.push('-ar', `${ui.samplerate.value}`);
+      args.push('-c:a', 'libmp3lame');
+      args.push('-b:a', `${entry.targetKbps}k`);
+      args.push('-map_metadata', '-1');
+      args.push('-id3v2_version', '3');
+      args.push(outputName);
+
+      const baseProgress = index / total;
+      ffmpeg.setProgress(({ ratio }) => {
+        const percent = Math.round(ratio * 100);
+        entry.progressBar.value = percent;
+        entry.progressLabel.textContent = `${percent}%`;
+        updateOverall(baseProgress + ratio / total);
+      });
+
+      try {
+        await ffmpeg.run(...args);
+        const out = ffmpeg.FS('readFile', outputName);
+        const buffer = out.buffer.slice(out.byteOffset, out.byteOffset + out.byteLength);
+        entry.output = new Blob([buffer], { type: 'audio/mpeg' });
+        entry.outputName = outputName;
+        entry.state = 'done';
+        entry.statusCell.innerHTML = '<span class="fine">Готово</span>';
+        entry.progressBar.value = 100;
+        entry.progressLabel.textContent = '100%';
+        updateOverall((index + 1) / total);
+      } catch (err) {
+        console.error(err);
+        entry.state = 'error';
+        entry.statusCell.innerHTML = '<span class="err">Ошибка</span>';
+        entry.progressBar.value = 0;
+        entry.progressLabel.textContent = '0%';
+        updateOverall((index + 1) / total);
+      } finally {
+        try { ffmpeg.FS('unlink', inputName); } catch (_) {}
+        try { ffmpeg.FS('unlink', outputName); } catch (_) {}
+        ffmpeg.setProgress(() => {});
+      }
+    };
+
+    const processAll = async () => {
+      if (!state.entries.length || state.processing) return;
+      if (state.entries.some((entry) => !entry.targetKbps)) return;
+      toggleControls(true);
+      ui.overall.value = 0;
+      try {
+        await ensureFfmpeg();
+        const total = state.entries.length;
+        for (let i = 0; i < total; i += 1) {
+          const entry = state.entries[i];
+          await processEntry(entry, i, total);
+        }
+        updateOverall(1);
+      } catch (err) {
+        console.error(err);
+      } finally {
+        toggleControls(false);
+        updateButtons();
+      }
+    };
+
+    const buildZip = async () => {
+      const ready = state.entries.filter((entry) => entry.state === 'done' && entry.output && entry.outputName);
+      if (!ready.length) return;
+      const zip = new JSZip();
+      ready.forEach((entry) => {
+        zip.file(entry.outputName, entry.output);
+      });
+      const blob = await zip.generateAsync({ type: 'blob' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = 'watchpack.zip';
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      URL.revokeObjectURL(url);
+    };
+
+    const loadDuration = (entry) => {
+      const el = document.createElement(entry.file.type.startsWith('video/') ? 'video' : 'audio');
+      el.preload = 'metadata';
+      const url = URL.createObjectURL(entry.file);
+      const cleanup = () => {
+        URL.revokeObjectURL(url);
+        el.remove();
+      };
+      el.onloadedmetadata = () => {
+        if (!Number.isFinite(el.duration) || el.duration === Infinity) {
+          el.currentTime = 1e101;
+          el.ontimeupdate = () => {
+            cleanup();
+            entry.duration = el.duration || 0;
+            entry.durationCell.textContent = formatDuration(entry.duration);
+            recalcBitrates();
+            updateSummary();
+          };
+        } else {
+          const duration = el.duration || 0;
+          cleanup();
+          entry.duration = duration;
+          entry.durationCell.textContent = formatDuration(duration);
+          recalcBitrates();
+          updateSummary();
+        }
+      };
+      el.onerror = () => {
+        cleanup();
+        entry.duration = 0;
+        entry.durationCell.textContent = '—';
+        recalcBitrates();
+        updateSummary();
+      };
+      el.src = url;
+    };
+
+    const onFiles = (fileList) => {
+      if (state.processing) return;
+      const files = Array.from(fileList || []);
+      if (!files.length) return;
+      if (!state.entries.length) ui.tbody.innerHTML = '';
+      let added = 0;
+      files.forEach((file) => {
+        const id = getFileId(file);
+        if (state.entries.some((entry) => entry.id === id)) return;
+        const entry = {
+          id,
+          file,
+          duration: null,
+          targetKbps: null,
+          output: null,
+          outputName: null,
+          state: 'pending',
+        };
+        createRow(entry);
+        state.entries.push(entry);
+        loadDuration(entry);
+        added += 1;
+      });
+      if (added) {
+        invalidateOutputs();
+        updateSummary();
+        recalcBitrates();
+        updateButtons();
+      }
+      updatePlaceholder();
+      ui.input.value = '';
+    };
+
+    const handleCalcClick = () => {
+      if (!state.entries.length || state.processing) return;
+      const suggested = recalcBitrates();
+      if (suggested && ui.preset.value !== 'custom') {
+        flashCalcResult(suggested);
+      }
+    };
+
+    const initDragAndDrop = () => {
+      ['dragenter','dragover'].forEach((evt) => {
+        ui.drop.addEventListener(evt, (e) => {
+          e.preventDefault();
+          if (state.processing) return;
+          ui.drop.classList.add('dragover');
+        });
+      });
+      ['dragleave','drop'].forEach((evt) => {
+        ui.drop.addEventListener(evt, (e) => {
+          e.preventDefault();
+          ui.drop.classList.remove('dragover');
+        });
+      });
+      ui.drop.addEventListener('drop', (e) => {
+        if (state.processing) return;
+        onFiles(e.dataTransfer.files);
+      });
+    };
+
+    const bindEvents = () => {
+      ui.chooseBtn.addEventListener('click', () => {
+        if (state.processing) return;
+        ui.input.click();
+      });
+      ui.input.addEventListener('change', (e) => onFiles(e.target.files));
+      ui.preset.addEventListener('change', () => {
+        handlePresetUi();
+        invalidateOutputs();
+        recalcBitrates();
+      });
+      ui.targetMb.addEventListener('change', () => {
+        invalidateOutputs();
+        recalcBitrates();
+      });
+      ui.bitrate.addEventListener('change', () => {
+        invalidateOutputs();
+        recalcBitrates();
+      });
+      ui.samplerate.addEventListener('change', invalidateOutputs);
+      ui.mono.addEventListener('change', invalidateOutputs);
+      ui.normalize.addEventListener('change', invalidateOutputs);
+      ui.calcBtn.addEventListener('click', handleCalcClick);
+      ui.startBtn.addEventListener('click', processAll);
+      ui.zipBtn.addEventListener('click', () => {
+        if (!ui.zipBtn.disabled) buildZip();
+      });
+      initDragAndDrop();
+    };
+
+    const init = () => {
+      ui.preset.value = 'pack30';
+      bindEvents();
+      handlePresetUi();
+      updatePlaceholder();
+      updateSummary();
+      updateEstimate();
+      updateButtons();
+    };
+
+    init();
   </script>
 </body>
 </html>
