@@ -1,0 +1,177 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+  <title>WatchPack — упаковщик музыки для часов</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;800&display=swap" rel="stylesheet" />
+  <style>
+    :root{
+      --bg:#0b0d10; --card:#151922; --fg:#e9edf1; --muted:#9aa6b2; --accent:#4da3ff; --ok:#18c37e; --warn:#ffb84d; --err:#ff5d5d; --border:rgba(255,255,255,.08);
+    }
+    *{box-sizing:border-box}
+    html,body{height:100%}
+    body{margin:0; background:var(--bg); color:var(--fg); font-family:Inter,system-ui,Segoe UI,Roboto,Arial,sans-serif;}
+    .wrap{max-width:980px; margin:0 auto; padding:14px;}
+    header{display:flex; align-items:center; justify-content:space-between; gap:16px; margin-bottom:16px}
+    h1{font-size:clamp(18px,4.5vw,22px); font-weight:800; margin:0}
+    .card{background:var(--card); border:1px solid var(--border); border-radius:16px; padding:12px; box-shadow:0 6px 28px rgba(0,0,0,.25)}
+    .grid{display:grid; gap:16px}
+    @media(min-width:880px){.grid{grid-template-columns:1.1fr .9fr}}
+    .drop{border:1.5px dashed var(--border); border-radius:14px; padding:12px; text-align:center; cursor:pointer; background:linear-gradient(180deg, rgba(255,255,255,.03), rgba(255,255,255,0)); position:relative}
+    .fileInput{position:absolute; inset:0; opacity:0; cursor:pointer}
+    .btn{appearance:none; background:var(--accent); color:#001122; border:0; border-radius:12px; padding:12px 16px; font-weight:700; cursor:pointer}
+    .btn[disabled]{opacity:.5; cursor:not-allowed}
+    .btn.ghost{background:transparent; color:var(--fg); border:1px solid var(--border)}
+    label{display:block; font-size:12px; color:var(--muted); margin-bottom:6px}
+    input[type="number"], select, input[type="text"], .pseudo{width:100%; background:#0f1218; border:1px solid var(--border); color:var(--fg); border-radius:12px; padding:10px 12px}
+    .row{display:flex; gap:10px; align-items:center; flex-wrap:wrap}
+    .switch{display:inline-flex; align-items:center; gap:10px}
+    .switch input{appearance:none; width:42px; height:26px; background:#0f1218; border:1px solid var(--border); border-radius:99px; position:relative; outline:none; cursor:pointer}
+    .switch input:checked{background:#123148; border-color:#214d73}
+    .switch input:before{content:""; position:absolute; inset:3px; width:20px; height:20px; border-radius:50%; background:#fff; transform:translateX(0); transition:.2s}
+    .switch input:checked:before{transform:translateX(16px)}
+    .list{max-height:320px; overflow:auto; border:1px solid var(--border); border-radius:12px}
+    table{width:100%; border-collapse:collapse; font-size:12px}
+    th,td{padding:10px 12px; border-bottom:1px solid var(--border)}
+    th{position:sticky; top:0; background:#111521; text-align:left; color:#c0c8d2}
+    .tag{display:inline-flex; align-items:center; gap:6px; padding:6px 8px; border-radius:999px; font-size:12px; background:#0f1218; border:1px solid var(--border); color:var(--muted)}
+    progress{width:100%; height:6px}
+    .muted{color:var(--muted)}
+    .fine{color:var(--ok)}
+    .warn{color:var(--warn)}
+    .err{color:var(--err)}
+    .hr{height:1px; background:var(--border); margin:12px 0}
+    footer{opacity:.7; font-size:12px; margin-top:12px}
+    .hint{font-size:12px; color:var(--muted)}
+    .kbd{padding:2px 6px; border-radius:6px; border:1px solid var(--border); background:#0f1218}
+    @media (max-width: 560px){
+      .wrap{padding:12px}
+      header{margin-bottom:10px}
+      .card{padding:12px}
+      .drop{padding:12px}
+      table{font-size:12px}
+      th:nth-child(3), td:nth-child(3){display:none}
+      .btn{padding:10px 12px}
+      .list{max-height:45vh}
+    }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <header>
+      <h1>WatchPack — упаковщик музыки для часов</h1>
+      <div class="tag" id="ffmpegStatus">FFmpeg: не загружен</div>
+    </header>
+
+    <div class="grid">
+      <div class="card">
+        <div id="drop" class="drop">
+          <strong>Перетащи файлы сюда</strong> или <button id="chooseBtn" class="btn" type="button">выбери</button>
+          <input type="file" id="fileInput" class="fileInput" accept="audio/*,video/*" multiple />
+        </div>
+
+        <div class="hr"></div>
+
+        <div class="row">
+          <div style="flex:1 1 220px">
+            <label>Пресет</label>
+            <select id="preset">
+              <option value="pack30" selected>Часы: весь набор ≤ 30 МБ (авто-битрейт)</option>
+              <option value="per3">Трек ≤ 3 МБ (авто по длительности)</option>
+              <option value="custom">Свои параметры</option>
+            </select>
+          </div>
+          <div style="flex:1 1 160px">
+            <label>Цель (для пресета)</label>
+            <input type="number" id="targetMb" min="5" max="2000" step="1" value="30" />
+            <div class="hint">Для «набор ≤ … МБ» или «≤ … МБ за трек»</div>
+          </div>
+          <div style="flex:1 1 160px">
+            <label>Битрейт, кбит/с (custom)</label>
+            <input type="number" id="bitrate" min="24" max="192" step="4" value="96" />
+          </div>
+          <div style="flex:1 1 160px">
+            <label>Частота, Гц</label>
+            <select id="samplerate">
+              <option value="44100">44100</option>
+              <option value="32000">32000</option>
+              <option value="24000">24000</option>
+              <option value="22050">22050</option>
+            </select>
+          </div>
+          <div class="switch" title="Моно экономит ~×2">
+            <input type="checkbox" id="mono" checked>
+            <label for="mono">Моно</label>
+          </div>
+          <div class="switch" title="Выравнивает громкость (может замедлить обработку)">
+            <input type="checkbox" id="normalize">
+            <label for="normalize">Нормализация</label>
+          </div>
+          <button id="calcBtn" class="btn ghost" type="button">Рассчитать битрейт</button>
+          <button id="startBtn" class="btn" type="button" disabled>Старт</button>
+          <button id="zipBtn" class="btn" type="button" disabled>Собрать ZIP</button>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="row" style="justify-content:space-between">
+          <div>
+            <div class="muted">Выбрано файлов: <span id="count">0</span></div>
+            <div class="muted">Суммарная длительность: <span id="sumdur">0:00</span></div>
+            <div class="muted">Оценка выходного размера: <span id="est">—</span></div>
+          </div>
+          <div class="tag">Контейнер: MP3 • Кодек: libmp3lame</div>
+        </div>
+        <div class="list" style="margin-top:8px">
+          <table>
+            <thead>
+              <tr><th>Файл</th><th>Длительность</th><th>Целевой кбит/с</th><th style="width:180px">Прогресс</th><th>Статус</th></tr>
+            </thead>
+            <tbody id="tbody"><tr><td colspan="5" class="muted">Добавь файлы…</td></tr></tbody>
+          </table>
+        </div>
+        <div style="margin-top:12px">
+          <label>Общий прогресс</label>
+          <progress id="overall" value="0" max="100"></progress>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script src="https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js"></script>
+  <script src="./libs/ffmpeg/ffmpeg.js"></script>
+  <script>
+    const $ = (s, p=document) => p.querySelector(s);
+    const ui = {
+      drop: $('#drop'),
+      chooseBtn: $('#chooseBtn'),
+      input: $('#fileInput'),
+      count: $('#count'),
+      sumdur: $('#sumdur'),
+      est: $('#est'),
+      tbody: $('#tbody'),
+      overall: $('#overall'),
+      preset: $('#preset'),
+      targetMb: $('#targetMb'),
+      bitrate: $('#bitrate'),
+      samplerate: $('#samplerate'),
+      mono: $('#mono'),
+      normalize: $('#normalize'),
+      calcBtn: $('#calcBtn'),
+      startBtn: $('#startBtn'),
+      zipBtn: $('#zipBtn'),
+      ffmpegStatus: $('#ffmpegStatus'),
+    };
+
+    // делаем "Часы" пресет по умолчанию и фиксируем при загрузке
+    window.addEventListener('DOMContentLoaded', ()=>{
+      ui.preset.value = 'pack30';
+    });
+
+    // остальные функции (ensureFFmpeg, onFiles, processAll, etc.) остаются без изменений
+  </script>
+</body>
+</html>
